@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 import math
 import os
 import random
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QVBoxLayout, QWidget)
 
 from .keys import KeyController
+from . import diagnostics as dg
 from .profiles import load_profiles, normalize, save_profiles
 from .recognition import PatternRecognitionWorker, RecognitionWorker
 
@@ -32,7 +34,7 @@ MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-tr-0.3.zip"
 PROFILE_FILE = APP / "profiles.json"
 
 AMBER, DIM, LINE = "#ffb020", "#8d8374", "#2b2621"
-METHODS = {"vosk": "Vosk komut tanıma", "pattern": "Kişisel ses örüntüsü"}
+METHODS = {"neural": "Kişisel sinir ağı (yeni)", "pattern": "Kişisel örüntü (MFCC/DTW)", "vosk": "Vosk komut tanıma"}
 
 def window_title_matches(expected: str, actual: str) -> bool:
     """Boş filtre, ön plandaki tüm pencerelere izin verir."""
@@ -220,7 +222,7 @@ class CommandRow(QFrame):
         lay.addWidget(Keycap(key, 62, 50))
         col = QVBoxLayout(); col.setSpacing(2)
         t = QLabel(phrase); t.setObjectName("rowt")
-        m = QLabel(("KISA BASIŞ" if mode == "press" else "SÖYLEYİNCE BIRAK") + "   ·   " + ("ÖRÜNTÜ HAZIR" if ready else "ÖRÜNTÜ YOK"))
+        m = QLabel(("KISA BASIŞ" if mode == "press" else "SÖYLEYİNCE BIRAK") + "   ·   " + (ready if isinstance(ready, str) else "ÖRÜNTÜ HAZIR" if ready else "ÖRÜNTÜ YOK"))
         m.setObjectName("mono"); col.addWidget(t); col.addWidget(m); lay.addLayout(col, 1)
         dot = QLabel("●"); dot.setStyleSheet(f"color:{AMBER if ready else '#3a342c'};font-size:16px"); lay.addWidget(dot)
 
@@ -255,12 +257,23 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AutoPress | Sesle oyun kontrolü"); self.resize(1180, 780); self.setMinimumSize(980, 660)
         self.keys = KeyController()
         self.worker = None; self.worker_kind = None; self.enr = None
+        self.log = dg.UtteranceLog()
+        self._pending_record = None
+        self._test_expected = None
+        self.review_events = {}
+        self.learning_undo = []
+        from .learning import AutoLearningGate
+        self.auto_gate = AutoLearningGate()
+        self.validation_counts = {}
+        self.last_key_sent_at = None
         self.metrics: list[float] = []; self.last_command = ""; self.last_time = 0.0; self.is_test = False
         self.selected = ""; self.device_index = None; self.device_labels = {"Varsayılan mikrofon": None}
         self.profiles = load_profiles(PROFILE_FILE)
         if not PROFILE_FILE.exists(): save_profiles(PROFILE_FILE, self.profiles)
         self.profile_name = next(iter(self.profiles))
         self._build()
+        self._update_learning_totals()
+        self.method_menu.currentTextChanged.connect(self._method_changed)
         self.download_done.connect(self._on_download)
         self.target_entry.setText(self._profile().get("target_window", ""))
         self.window_pick_deadline = 0.0
@@ -286,7 +299,7 @@ class MainWindow(QMainWindow):
         self.device_menu = QComboBox(); self.device_menu.setMinimumWidth(220)
         self.device_menu.currentTextChanged.connect(lambda t: setattr(self, "device_index", self.device_labels.get(t)))
         self.method_menu = QComboBox(); self.method_menu.addItems(list(METHODS.values()))
-        self.method_menu.setCurrentText(METHODS["pattern"])
+        self.method_menu.setCurrentText(METHODS["neural"])
         for cap, w in (("OYUN PROFİLİ", self.profile_menu), ("", add), ("MİKROFON", self.device_menu), ("YÖNTEM", self.method_menu)):
             col = QVBoxLayout(); col.setSpacing(3)
             if cap: col.addWidget(label(cap, "mono"))
@@ -362,9 +375,35 @@ class MainWindow(QMainWindow):
         l.addWidget(label("Bu ekranda hiçbir tuş oyuna gönderilmez. İki yöntemi aynı ifadeyle ayrı ayrı deneyin; ‘kararsız’ sonuç tuş tetiklemez.", "dim", True))
         row = QHBoxLayout(); row.setSpacing(10)
         self.expected_entry = QLineEdit(); self.expected_entry.setPlaceholderText("Hedef ifade (ör. zırh)")
+        self.expected_entry.textEdited.connect(lambda _: self.stop_listening() if self._running() and self.is_test else None)
         go = QPushButton("▶  DİNLEMEYİ DENE"); go.setObjectName("primary"); go.clicked.connect(self.start_test)
         clr = QPushButton("TEMİZLE"); clr.clicked.connect(self.clear_results)
         row.addWidget(self.expected_entry, 1); row.addWidget(go); row.addWidget(clr); l.addLayout(row)
+        learning = panel(); fl = QVBoxLayout(learning)
+        fl.addWidget(label("SİNİR AĞINA GERİ BİLDİRİM", "mono"))
+        fl.addWidget(label("Son 20 söyleyişten birini seçin. Doğru'ya basın veya gerçekte söylediğiniz komutu seçerek düzeltin. Yalnız sayısal ses özelliği öğrenilir; ham ses tutulmaz.", "dim", True))
+        self.review_menu = QComboBox(); fl.addWidget(self.review_menu)
+        fr = QHBoxLayout()
+        self.feedback_correct = QPushButton("DOĞRU — ÖĞREN")
+        self.feedback_correct.clicked.connect(lambda: self._manual_learning(False))
+        fr.addWidget(self.feedback_correct)
+        correction_row = QHBoxLayout()
+        self.feedback_label = QComboBox(); correction_row.addWidget(self.feedback_label, 1)
+        fix = QPushButton("SEÇİLEN KOMUT OLARAK ÖĞRET")
+        fix.clicked.connect(lambda: self._manual_learning(True)); correction_row.addWidget(fix)
+        reject = QPushButton("KOMUT DEĞİL / ÖĞRENME")
+        reject.clicked.connect(self._reject_learning); fr.addWidget(reject)
+        fl.addLayout(fr); fl.addLayout(correction_row)
+        self.learning_status = label("Henüz sinir ağı sonucu yok. Canlı dinleme sonuçları da burada incelenebilir.", "dim", True)
+        self.learning_totals = label("", "mono", True); fl.addWidget(self.learning_totals)
+        fl.addWidget(self.learning_status); l.addWidget(learning)
+        self.capture_validation = QCheckBox("Doğrulama özelliklerini RAM'de tut (öğrenme bu testte durur)")
+        l.addWidget(self.capture_validation)
+        self.capture_validation.toggled.connect(lambda _: self.stop_listening() if self._running() and self.is_test else None)
+        actions=QHBoxLayout()
+        summary=QPushButton("DOĞRULAMA ÖZETİ"); summary.clicked.connect(self.show_summary)
+        export=QPushButton("DOĞRULAMA ÖZELLİKLERİNİ DIŞA AKTAR"); export.clicked.connect(self.export_validation)
+        actions.addWidget(summary); actions.addWidget(export); l.addLayout(actions)
         self.results_host = QWidget(); self.results_lay = QVBoxLayout(self.results_host)
         self.results_lay.setContentsMargins(0, 0, 6, 0); self.results_lay.setSpacing(8); self.results_lay.addStretch(1)
         l.addWidget(scroll(self.results_host), 1)
@@ -403,6 +442,36 @@ class MainWindow(QMainWindow):
         r = label("DAHA SEÇİCİ\ndoğru sözü reddedebilir", "dim"); r.setAlignment(Qt.AlignRight); row.addWidget(r)
         sl.addLayout(row); self.sens_label = label("Dengeli ayar", "mono"); sl.addWidget(self.sens_label); l.addWidget(s)
 
+        self.verify_sounds_check = QCheckBox("Benzer seslerde ek doğrulama (yanlış tuşları azaltır)")
+        self.verify_sounds_check.setChecked(self._profile().get('verify_similar_sounds',True))
+        self.verify_sounds_check.toggled.connect(self._set_sound_verification)
+        l.addWidget(self.verify_sounds_check)
+        l.addWidget(label("Sinir ağıyla bağımsız ses kontrolü anlaşmazsa tuş gönderilmez. Aynı eğitimden alınan ses özellikleri, yoksa bu profildeki mevcut yeni MFCC kayıtları kullanılır. Eksik kayıt varsa yeniden öğretmek gerekir. Değişiklik yeni dinlemede uygulanır.", "dim", True))
+        self.auto_learning_check = QCheckBox("Sinir ağı: güçlü eşleşmelerden otomatik öğren")
+        self.auto_learning_check.setChecked(self._profile().get('auto_learning', True))
+        self.auto_learning_check.toggled.connect(self._set_auto_learning)
+        l.addWidget(self.auto_learning_check)
+        l.addWidget(label("Otomatik öğrenme doğruluğu kesin bilemez. İlk model ve güncel model anlaşırsa, üç farklı güçlü söyleyişten sonra sınırlı örnek ekler. İlk kayıtlar korunur. Deneme sekmesinden manuel onay/düzeltme yapabilirsiniz.", "dim", True))
+        undo = QPushButton("SON ÖĞRENMEYİ GERİ AL (BU OTURUM)")
+        undo.clicked.connect(self._undo_learning); l.addWidget(undo)
+        reset = QPushButton("SONRADAN ÖĞRENİLENLERİ SİL — İLK KAYITLARI KORU")
+        reset.clicked.connect(self._reset_learning); l.addWidget(reset)
+        self.continuous_check = QCheckBox("Cümle içinde kişisel komut ara (deneysel)")
+        self.continuous_check.setChecked(self._profile().get("continuous_spotting", False))
+        self.continuous_check.toggled.connect(self._save_continuous)
+        l.addWidget(self.continuous_check)
+        l.addWidget(label("Açıksa komut cümle içinde geçince de çalışabilir; cümlenin bitmesini beklemez. Normal konuşmadaki aynı sözcük de tuşu tetikleyebilir. Önce Deneme'de sınayın. Sessizlik ve erken karar ayarları yalnız kapalıyken kullanılır.", "dim", True))
+        self.decision_menu = QComboBox()
+        self.decision_menu.addItems(["Seçici", "Dengeli", "Atak"])
+        self.decision_menu.setCurrentIndex(["selective", "balanced", "aggressive"].index(self._profile().get("decision_mode", "balanced")))
+        l.addWidget(label("KİŞİSEL ÖRÜNTÜ · KARAR MODU", "mono")); l.addWidget(self.decision_menu)
+        l.addWidget(label("Seçici: yanlış tuştan kaçınır. Dengeli: önerilen. Atak: daha kolay kabul eder, yanlış tuş riski artar.", "dim", True))
+        self.decision_menu.currentIndexChanged.connect(self._save_decision_mode)
+        verify = QPushButton("ERKEN KARARI DENEME SONUÇLARIYLA ETKİNLEŞTİR")
+        verify.clicked.connect(self._enable_early_decisions); l.addWidget(verify)
+        l.addWidget(label("Varsayılan kapalı. Bu oturumda en az 5 doğru ve sıfır hatalı/reddedilen denemesi olan komutlar için açılır. Yeniden öğretmede kapanır.", "dim", True))
+        disable = QPushButton("ERKEN KARARI KAPAT")
+        disable.clicked.connect(self._disable_early_decisions); l.addWidget(disable)
         timing = panel(); tl = QVBoxLayout(timing); tl.setContentsMargins(18, 16, 18, 16)
         tl.addWidget(label("KİŞİSEL ÖRÜNTÜ · SESSİZLİK BEKLEMESİ", "mono"))
         self.silence_duration = QSpinBox(); self.silence_duration.setRange(100, 600); self.silence_duration.setSingleStep(25)
@@ -427,7 +496,22 @@ class MainWindow(QMainWindow):
 
     # ---------- state ----------
     def _profile(self): return self.profiles[self.profile_name]
-    def _method(self): return "pattern" if self.method_menu.currentText() == METHODS["pattern"] else "vosk"
+    def _method(self):
+        return next((key for key, value in METHODS.items() if value == self.method_menu.currentText()), 'neural')
+
+    def _template_field(self):
+        return 'neural_templates' if self._method() == 'neural' else 'audio_templates'
+
+    def _pending_field(self):
+        return 'pending_neural_templates' if self._method() == 'neural' else 'pending_audio_templates'
+
+    def _method_changed(self, *_):
+        self._clear_learning_review()
+        self.log.clear(); self._pending_record=None
+        if self._running(): self.stop_listening()
+        self.validation_counts.clear()
+        self.refresh_commands(); self.update_pattern_status()
+        self.set_status('Sinir ağı için yeni örnekler gerekir; eski MFCC kayıtları dönüştürülemez.' if self._method() == 'neural' else 'Tanıma yöntemi değiştirildi.')
     def _running(self): return bool(self.worker and self.worker.isRunning())
     def info(self, title, msg): QMessageBox.information(self, title, msg)
     def set_status(self, msg): self.status_label.setText(msg)
@@ -439,13 +523,50 @@ class MainWindow(QMainWindow):
         self.listen_button.setText("▶  DİNLEMEYİ BAŞLAT" if key == "off" else "■  DURDUR")
 
     def _change_profile(self, name):
+        self._clear_learning_review()
         if name not in self.profiles: return
+        self.log.clear(); self._pending_record=None
+        if self._running(): self.stop_listening()
+        self.validation_counts.clear()
         self.profile_name = name; self.selected = ""
         self.target_entry.setText(self._profile().get("target_window", ""))
+        self.verify_sounds_check.blockSignals(True)
+        self.verify_sounds_check.setChecked(self._profile().get('verify_similar_sounds',True))
+        self.verify_sounds_check.blockSignals(False)
+        self.auto_learning_check.blockSignals(True)
+        self.auto_learning_check.setChecked(self._profile().get('auto_learning', True))
+        self.auto_learning_check.blockSignals(False)
+        self.continuous_check.blockSignals(True)
+        self.continuous_check.setChecked(self._profile().get("continuous_spotting", False))
+        self.continuous_check.blockSignals(False)
+        self.decision_menu.blockSignals(True)
+        self.decision_menu.setCurrentIndex(["selective", "balanced", "aggressive"].index(self._profile().get("decision_mode", "balanced")))
+        self.decision_menu.blockSignals(False)
         self.silence_duration.blockSignals(True)
         self.silence_duration.setValue(self._profile().get("silence_ms", 150))
         self.silence_duration.blockSignals(False)
         self.refresh_commands(); self.update_pattern_status()
+
+    def _save_continuous(self, enabled):
+        self._profile()["continuous_spotting"] = enabled
+        self.validation_counts.clear()
+        self.save_profile(silent=True)
+        self.set_status("Komut arama ayarı kaydedildi; yeni dinlemede uygulanır.")
+
+    def _enable_early_decisions(self):
+        self._profile()["early_commands"] = [k for k, v in self.validation_counts.items() if v[0] >= 5 and v[1:] == [0, 0] and k in self._profile()["commands"]]
+        self.save_profile(silent=True)
+        self.set_status("Erken karar yeni dinlemede uygulanır: " + ", ".join(self._profile()["early_commands"]))
+
+    def _disable_early_decisions(self):
+        self._profile()["early_commands"] = []; self.save_profile(silent=True)
+        self.set_status("Erken karar kapatıldı; dinlemeyi yeniden başlatın.")
+
+    def _save_decision_mode(self, index):
+        self.validation_counts.clear()
+        self._profile()["early_commands"] = []
+        self._profile()["decision_mode"] = ["selective", "balanced", "aggressive"][index]
+        self.save_profile(silent=True)
 
     def _save_silence_duration(self, value):
         self._profile()["silence_ms"] = value
@@ -468,12 +589,17 @@ class MainWindow(QMainWindow):
             self.set_status(f"Mikrofon listesi alınamadı: {exc}")
 
     def refresh_commands(self):
+        self._update_learning_totals()
         while self.list_lay.count() > 1:
             w = self.list_lay.takeAt(0).widget()
             if w: w.deleteLater()
-        cmds, tpl = self._profile().get("commands", {}), self._profile().get("audio_templates", {})
+        cmds, tpl = self._profile().get("commands", {}), self._profile().get(self._template_field(), {})
         for i, (phrase, a) in enumerate(cmds.items()):
-            row = CommandRow(phrase, a["key"], a["mode"], phrase in tpl, phrase == self.selected)
+            pending = self._profile().get(self._pending_field(), {})
+            state = ("YENİ ÖRNEKLER KAYDEDİLDİ · 5/5 · ETKİNLEŞMEYİ BEKLİYOR" if phrase in pending else
+                     "YENİ ÖRÜNTÜ ETKİN · 5/5" if tpl.get(phrase, {}).get("version") in (2, 3) else
+                     "ESKİ ÖRÜNTÜ ETKİN · YENİDEN ÖĞRETİN" if phrase in tpl else False)
+            row = CommandRow(phrase, a["key"], a["mode"], state, phrase == self.selected)
             row.clicked.connect(self.select_command); self.list_lay.insertWidget(i, row)
         if not cmds:
             self.list_lay.insertWidget(0, label("Henüz komut yok. ‘Söyleyerek ekle’ ile başlayın.", "dim"))
@@ -488,13 +614,25 @@ class MainWindow(QMainWindow):
         self.refresh_commands(); self.update_pattern_status()
 
     def update_pattern_status(self):
-        cmds, tpl = self._profile().get("commands", {}), self._profile().get("audio_templates", {})
-        ready = sum(p in tpl for p in cmds); p = self.selected
-        n = len(tpl.get(p, {}).get("samples", [])) if p else 0
-        nxt = ("Başlangıç: bir komut ekleyin." if not cmds else
-               f"Sıradaki: Deneme sekmesinde ‘{p}’ ifadesini kişisel yöntemle sınayın." if p in tpl else
-               f"Sıradaki: ‘{p}’ için ‘5 örnek kaydet’e basın." if p else "Başlamak için bir komuta tıklayın.")
-        self.pattern_status.setText(f"KİŞİSEL SES ÖRÜNTÜSÜ  {ready}/{len(cmds)} HAZIR  ·  SEÇİLİ ÖRNEK {n}/5\n{nxt}")
+        cmds, tpl = self._profile().get("commands", {}), self._profile().get(self._template_field(), {})
+        pending = self._profile().get(self._pending_field(), {})
+        p = self.selected
+        if pending:
+            remaining = sorted(set(cmds) - set(pending))
+            n = len(pending.get(p, {}).get("samples", []))
+            self.pattern_status.setText(
+                f"YENİ EĞİTİM: {len(set(cmds) & set(pending))}/{len(cmds)} KOMUT KAYDEDİLDİ"
+                f" · SEÇİLİ YENİ ÖRNEK {n}/5\n"
+                + ("Bu komutun yeni örnekleri diske kaydedildi. " if p in pending else "")
+                + "Yeni eğitimi etkinleştirmek için kalanlar: " + ", ".join(remaining)
+                + "\nTamamlanana kadar mevcut örüntüler kullanılır.")
+        else:
+            ready = sum(p in tpl for p in cmds)
+            n = len(tpl.get(p, {}).get("samples", [])) if p else 0
+            nxt = ("Başlangıç: bir komut ekleyin." if not cmds else
+                   f"Sıradaki: Deneme sekmesinde ‘{p}’ ifadesini kişisel yöntemle sınayın." if p in tpl else
+                   f"Sıradaki: ‘{p}’ için ‘5 örnek kaydet’e basın." if p else "Başlamak için bir komuta tıklayın.")
+            self.pattern_status.setText(f"KİŞİSEL SES ÖRÜNTÜSÜ {ready}/{len(cmds)} HAZIR · SEÇİLİ ÖRNEK {n}/5\n{nxt}")
 
     # ---------- commands ----------
     def upsert_command(self):
@@ -510,6 +648,9 @@ class MainWindow(QMainWindow):
         p = self.selected
         if not p: self.info("Önce komut seçin", "Silmek istediğiniz komuta tıklayın."); return
         if QMessageBox.question(self, "Komutu sil", f"‘{p}’ komutu ve varsa kişisel örüntüsü silinsin mi?") != QMessageBox.Yes: return
+        for field in ("pending_audio_templates", "pending_neural_templates", "neural_templates"):
+            self._profile().get(field, {}).pop(p, None)
+        self.validation_counts.clear(); self._profile()["early_commands"] = []
         self._profile()["commands"].pop(p, None); self._profile().get("audio_templates", {}).pop(p, None)
         self.selected = ""; self.save_profile(silent=True); self.refresh_commands(); self.update_pattern_status()
 
@@ -532,10 +673,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Kaydedilemedi", str(exc)); return False
 
     def delete_audio_templates(self):
-        tpl = self._profile().get("audio_templates", {})
+        tpl = self._profile().get(self._template_field(), {})
         if not tpl: self.info("Henüz örüntü yok", "Bu profilde silinecek kişisel ses özelliği yok."); return
         if QMessageBox.question(self, "Ses özelliklerini sil", f"{len(tpl)} kişisel örüntü silinsin mi?") != QMessageBox.Yes: return
-        self._profile()["audio_templates"] = {}; self.save_profile(silent=True)
+        self._profile()[self._pending_field()] = {}; self._profile()["early_commands"] = []
+        self._profile()[self._template_field()] = {}; self.save_profile(silent=True)
         self.refresh_commands(); self.update_pattern_status(); self.set_status("Kişisel ses özellikleri silindi.")
 
     # ---------- enrollment ----------
@@ -543,6 +685,7 @@ class MainWindow(QMainWindow):
         p = self.selected
         if not p: self.info("Bir komut seçin", "Önce listeden komuta tıklayın."); return
         if self._running(): self.info("Dinleme açık", "Örnek kaydetmeden önce dinlemeyi durdurun."); return
+        self.method_menu.setEnabled(False); self.profile_menu.setEnabled(False)
         d = QDialog(self); d.setWindowTitle("Kişisel ses örneği"); d.setMinimumWidth(520)
         l = QVBoxLayout(d); l.setContentsMargins(26, 22, 26, 22); l.setSpacing(12)
         l.addWidget(label("SES ÖRNEĞİ KAYDI", "mono")); l.addWidget(label(f"‘{p}’", "hero"))
@@ -560,17 +703,25 @@ class MainWindow(QMainWindow):
 
         def begin():
             start.setEnabled(False); msg.setText("0/5 alındı — şimdi ifadeyi söyleyin.")
-            w = PatternRecognitionWorker(self.device_index, {}, self.sens.value() / 100, enrollment_phrase=p, sample_count=5, silence_seconds=0.35)
+            w = PatternRecognitionWorker(self.device_index, {}, self.sens.value() / 100, enrollment_phrase=p, sample_count=5, silence_seconds=self.silence_duration.value()/1000, enrollment_version=3 if self._method() == "neural" else 2)
             self._start_worker(w, "enroll"); self._set_state("enroll")
         def finish():
+            pending = self._profile().get(self._pending_field(), {})
+            if pending:
+                remaining = sorted(set(self._profile()["commands"]) - set(pending))
+                d.accept()
+                self.stack.setCurrentIndex(0); self.nav_group.button(0).setChecked(True)
+                if remaining: self.select_command(remaining[0])
+                return
             self.stack.setCurrentIndex(1); self.nav_group.button(1).setChecked(True)
-            self.expected_entry.setText(p); self.method_menu.setCurrentText(METHODS["pattern"]); d.accept()
+            self.expected_entry.setText(p); self.method_menu.setCurrentText(METHODS["neural"]); d.accept()
         start.clicked.connect(begin); done.clicked.connect(finish); close.clicked.connect(d.reject)
         d.finished.connect(self._enroll_closed)
         self.enr = {"dialog": d, "msg": msg, "pips": pips, "start": start, "done": done, "phrase": p}
         d.open()
 
     def _enroll_closed(self, *_):
+        self.method_menu.setEnabled(True); self.profile_menu.setEnabled(True)
         if self.worker_kind == "enroll" and self._running(): self.stop_listening()
         self.enr = None
 
@@ -583,10 +734,32 @@ class MainWindow(QMainWindow):
     def _on_trained(self, phrase, template):
         if not self.enr: return
         try:
-            self._profile().setdefault("audio_templates", {})[phrase] = template
+            self.validation_counts.clear()
+            self._clear_learning_review()
+            self._profile()["early_commands"] = []
+            pending_field = 'pending_neural_templates' if template['version'] == 3 else 'pending_audio_templates'
+            active_field = 'neural_templates' if template['version'] == 3 else 'audio_templates'
+            pending = self._profile().setdefault(pending_field, {})
+            pending[phrase] = template
+            required = set(self._profile()["commands"])
+            if required <= set(pending):
+                self._profile()[active_field] = {key: pending[key] for key in required}
+                self._profile()[pending_field] = {}
+                if template["version"] == 3: self._profile()["adaptive_learning"] = {}
             save_profiles(PROFILE_FILE, self.profiles)
             self.refresh_commands(); self.update_pattern_status(); self._on_progress(5, 5)
-            self.enr["msg"].setText("KAYIT TAMAM — 5/5. Ses özellikleri profile otomatik kaydedildi.")
+            remaining = required - set(pending)
+            message = ("Yeni eğitim hazır. Deneme turunda her komutu en az 5 kez söyleyin." if not self._profile().get(pending_field) else
+                       "Kayıt alındı. Yeni yöntemi açmak için kalan komutları öğretin: " + ", ".join(sorted(remaining)))
+            if not self._profile().get(pending_field):
+                from .acoustic import ShortCommandMatcher
+                if template['version'] == 3:
+                    from .neural import NeuralMatcher
+                    calibrated = NeuralMatcher(self._profile()[active_field])
+                else: calibrated = ShortCommandMatcher(self._profile()[active_field])
+                if calibrated.warnings: message += " Karışma riski: " + ", ".join(calibrated.warnings)
+            self.enr["done"].setText("BİTTİ — SIRADAKİ KOMUTA GEÇ" if self._profile().get(pending_field) else "BİTTİ — DENEMEYE GEÇ")
+            self.enr["msg"].setText(message)
             self.enr["done"].setEnabled(True); self._set_state("off")
             self.set_status(f"‘{phrase}’ için ses örüntüsü kaydedildi.")
         except Exception as exc:
@@ -595,10 +768,22 @@ class MainWindow(QMainWindow):
     # ---------- listening ----------
     def _start_worker(self, w, kind):
         self.worker, self.worker_kind = w, kind
+        self._test_expected=normalize(self.expected_entry.text()) if self.is_test else None
         w.status.connect(self._on_status); w.failed.connect(self._on_error)
-        w.phrase.connect(self._on_phrase); w.observed.connect(self._on_observed)
+        w.phrase.connect(lambda *args: self._on_phrase(*args) if self.worker is w and not w._stop.is_set() else None); w.observed.connect(self._on_observed)
+        if hasattr(w, 'learning_candidate'):
+            from .learning import training_id
+            profile_name = self.profile_name
+            base_id = training_id(self._profile().get('neural_templates', {}))
+            w.learning_candidate.connect(lambda event: self._on_learning_candidate(profile_name, base_id, event) if self.worker is w else None)
+        self._pending_record = None
+        if hasattr(w,'record'):
+            captured_profile = self.profile_name
+            captured_method = self._method()
+            w.record.connect(lambda rec: self._on_record(rec) if self.worker is w and self.profile_name==captured_profile and self._method()==captured_method and not w._stop.is_set() else None)
         w.level.connect(self.scope.amp)
         self.hero_latency.setToolTip("Konuşma başlangıcından tanıma kararına kadar geçen süre; oyunun tepki süresini içermez.")
+        if hasattr(w, "diagnostics"): w.diagnostics.connect(self._on_diagnostics)
         if hasattr(w, "timings"): w.timings.connect(self._on_timings)
         if hasattr(w, "progress"): w.progress.connect(self._on_progress)
         if hasattr(w, "trained"): w.trained.connect(self._on_trained)
@@ -616,8 +801,8 @@ class MainWindow(QMainWindow):
     def start_test(self):
         if not normalize(self.expected_entry.text()):
             self.info("Hedef ifade gerekli", "‘Hedef ifade’ kutusuna söyleyeceğiniz kelimeyi yazın."); return
-        if self._method() == "pattern":
-            missing = sorted(set(self._profile().get("commands", {})) - set(self._profile().get("audio_templates", {})))
+        if self._method() in ("pattern", "neural"):
+            missing = sorted(set(self._profile().get("commands", {})) - set(self._profile().get(self._template_field(), {})))
             if missing: self.info("Ses örneği eksik", "Her komut için 5 örnek kaydedin. Eksik: " + ", ".join(missing)); return
         self.start_listening(True)
 
@@ -628,9 +813,11 @@ class MainWindow(QMainWindow):
             if not MODEL.is_dir(): self.info("Türkçe model gerekli", "Ayarlar’daki ‘Türkçe tanıma modelini indir’ düğmesini kullanın."); return
             w = RecognitionWorker(MODEL, self.device_index, sens, commands=self._profile().get("commands", {}), test_mode=test)
         else:
-            tpl = self._profile().get("audio_templates", {})
+            tpl = self._profile().get(self._template_field(), {})
             if not tpl: self.info("Önce örnek kaydedin", "Bir komut seçip 5 kez ses örneği kaydedin."); return
-            w = PatternRecognitionWorker(self.device_index, tpl, sens, test_mode=test, silence_seconds=self.silence_duration.value()/1000)
+            from .verification import verification_templates
+            verify = verification_templates(tpl,self._profile().get('audio_templates',{})) if method == 'neural' and self._profile().get('verify_similar_sounds',True) else {}
+            w = PatternRecognitionWorker(self.device_index, tpl, sens, phonetic_templates=verify, test_mode=test, silence_seconds=self.silence_duration.value()/1000, decision_mode=self._profile().get("decision_mode", "balanced"), early_commands=self._profile().get("early_commands", []), continuous=self._profile().get("continuous_spotting", False), learning=self._profile().get("adaptive_learning", {}), capture_features=self.capture_validation.isChecked() and test)
         self.is_test = test; self.save_profile(silent=True)
         self._start_worker(w, "test" if test else method); self._set_state("test" if test else "live")
 
@@ -657,6 +844,197 @@ class MainWindow(QMainWindow):
         self.set_status("Komutu söyleyin; duyulan ifade kutuya yazılır. Sonra ‘Tuşu yakala’ya basıp bir tuşa dokunun.")
 
     # ---------- events ----------
+    def _clear_learning_review(self):
+        from .learning import AutoLearningGate
+        self.review_events.clear()
+        self.auto_gate = AutoLearningGate()
+        self.review_menu.clear(); self.feedback_label.clear()
+        self.learning_status.setText("Yeni profil/yöntem için öğrenme incelemesi temizlendi.")
+
+    def _update_learning_totals(self):
+        examples = self._profile().get('adaptive_learning', {}).get('examples', [])
+        manual = sum(e['source']=='manual' for e in examples)
+        self.learning_totals.setText(f"KALICI EK ÖRNEK: {manual} MANUEL · {len(examples)-manual} OTOMATİK · İLK KAYITLAR KORUNUR")
+        blocked = self._profile().get('adaptive_learning',{}).get('blocked_labels',[])
+        if blocked: self.learning_totals.setText(self.learning_totals.text()+"\nOTOMATİK ÖĞRENMESİ DURAKLATILAN: "+", ".join(blocked))
+
+    def _set_sound_verification(self, enabled):
+        self._profile()['verify_similar_sounds'] = enabled
+        self.save_profile(silent=True)
+        self.set_status("Ek ses doğrulaması kaydedildi; dinlemeyi yeniden başlatın.")
+
+    def _set_auto_learning(self, enabled):
+        before = self._profile().get('auto_learning', True)
+        self._profile()['auto_learning'] = enabled
+        from .learning import AutoLearningGate
+        self.auto_gate = AutoLearningGate()
+        if self.save_profile(silent=True):
+            self.learning_status.setText("Otomatik öğrenme açık." if enabled else "Otomatik öğrenme kapalı; manuel onay kullanılabilir.")
+        else:
+            self._profile()['auto_learning'] = before
+            self.auto_learning_check.blockSignals(True)
+            self.auto_learning_check.setChecked(before)
+            self.auto_learning_check.blockSignals(False)
+
+    def _on_learning_candidate(self, profile_name, base_id, event):
+        from .learning import training_id, add_example
+        templates = self._profile().get('neural_templates', {})
+        if self.profile_name != profile_name or self._method() != 'neural' or training_id(templates) != base_id:
+            return
+        event = copy.deepcopy(event)
+        if self.is_test and event.get('prediction') != normalize(self.expected_entry.text()):
+            event['auto_eligible'] = False
+        event['base_id'] = base_id; event['received_at'] = time.monotonic()
+        self.review_events[event['id']] = event
+        while len(self.review_events) > 20:
+            oldest = next(iter(self.review_events))
+            del self.review_events[oldest]
+            index = self.review_menu.findData(oldest)
+            if index >= 0: self.review_menu.removeItem(index)
+        self.review_menu.insertItem(0, f"{event['prediction'] or 'Reddedildi'} · {event['reason']} · {event['id'][:6]}", event['id'])
+        self.review_menu.setCurrentIndex(0)
+        previous = self.feedback_label.currentText()
+        self.feedback_label.clear(); self.feedback_label.addItems(list(templates))
+        self.feedback_label.setCurrentText(event['prediction'] or previous or event.get('suggestion',''))
+        self.learning_status.setText("Son söyleyiş incelemeye hazır. Doğruysa onaylayabilir veya doğru komutu seçebilirsiniz.")
+        learning = self._profile().get('adaptive_learning', {})
+        active = self.worker and not self.worker._stop.is_set()
+        if self._profile().get('auto_learning', True) and active and not (self.is_test and self.capture_validation.isChecked()) and self.auto_gate.consider(event, learning):
+            updated = add_example(learning, templates, event, event['prediction'], 'auto')
+            if self._commit_learning(updated):
+                self.learning_status.setText(f"‘{event['prediction']}’ güçlü eşleşmelerden otomatik öğrenildi. Yanlışsa aşağıdan düzeltin veya geri alın.")
+
+    def _selected_learning_event(self):
+        from .learning import training_id
+        event = self.review_events.get(self.review_menu.currentData())
+        if (not event or time.monotonic()-event['received_at'] > 300 or
+                event['base_id'] != training_id(self._profile().get('neural_templates', {}))):
+            self.learning_status.setText("Bu söyleyiş yok veya süresi doldu; yeniden söyleyin.")
+            return None
+        return event
+
+    def _commit_learning(self, data, remember=True):
+        from .learning import preserves_enrollment, training_id, validate_learning
+        templates = self._profile().get('neural_templates', {})
+        try:
+            data = validate_learning(data, templates)
+            if data and not preserves_enrollment(templates, data, self._profile().get('decision_mode','balanced')):
+                self.learning_status.setText("Bu örnek ilk kayıtların tanınmasını bozdu; eklenmedi. Yeni bir söyleyiş deneyin.")
+                return False
+            previous = copy.deepcopy(self._profile().get('adaptive_learning', {}))
+            if data == previous:
+                self.learning_status.setText("Bu söyleyiş zaten aynı şekilde öğrenilmiş.")
+                return False
+            profiles = copy.deepcopy(self.profiles)
+            profiles[self.profile_name]['adaptive_learning'] = data
+            save_profiles(PROFILE_FILE, profiles)
+        except Exception as exc:
+            self.learning_status.setText(f"Öğrenme kaydedilemedi: {exc}")
+            return False
+        self.profiles = profiles
+        self._update_learning_totals()
+        if remember:
+            self.learning_undo.append((self.profile_name,training_id(templates),previous))
+            del self.learning_undo[:-5]
+        if self.worker_kind == 'neural' or (self.worker_kind == 'test' and self._method()=='neural'):
+            if self.worker and hasattr(self.worker,'update_learning'): self.worker.update_learning(data)
+        return True
+
+    def _manual_learning(self, correction):
+        if self.is_test and self._running() and self.capture_validation.isChecked():
+            self.learning_status.setText("Doğrulama sırasında öğrenme durur; öğrenmek için önce testi durdurun.")
+            return
+        from .learning import add_example
+        event = self._selected_learning_event()
+        if not event: return
+        label = self.feedback_label.currentText() if correction else event.get('prediction')
+        if not label:
+            self.learning_status.setText("Reddedilen söyleyiş için doğru komutu seçip ‘Seçilen komut olarak öğret’ düğmesini kullanın.")
+            return
+        try:
+            updated = add_example(self._profile().get('adaptive_learning', {}),
+                                  self._profile()['neural_templates'],event,label,'manual')
+            if event.get('prediction') and label != event['prediction']:
+                updated['blocked_labels'] = list(set(updated.get('blocked_labels',[])) | {event['prediction']})
+        except ValueError as exc:
+            self.learning_status.setText(str(exc)); return
+        if self._commit_learning(updated):
+            self.auto_gate.support.clear()
+            self.learning_status.setText(f"‘{label}’ manuel onayınızla öğrenildi. Yeni kişisel başlık bir sonraki ses bloğunda uygulanır.")
+
+    def _reject_learning(self):
+        event = self._selected_learning_event()
+        if not event: return
+        self.auto_gate.support.clear()
+        data = copy.deepcopy(self._profile().get('adaptive_learning', {}))
+        if event.get('prediction'):
+            from .learning import training_id
+            from .neural import MODEL_ID
+            if not data: data = {'model_id':MODEL_ID,'training_id':training_id(self._profile()['neural_templates']),'examples':[]}
+            data['blocked_labels'] = list(set(data.get('blocked_labels',[])) | {event['prediction']})
+        if data:
+            data['examples'] = [e for e in data['examples'] if e['id'] != event['id']]
+            if not self._commit_learning(data): return
+        self.learning_status.setText("Bu söyleyiş öğrenmeden çıkarıldı; komut değil olarak bildirildi.")
+
+    def _undo_learning(self):
+        from .learning import training_id
+        fingerprint = training_id(self._profile().get('neural_templates', {}))
+        for i in range(len(self.learning_undo)-1,-1,-1):
+            profile, base, data = self.learning_undo[i]
+            if profile == self.profile_name and base == fingerprint:
+                if self._commit_learning(data, remember=False):
+                    self.learning_undo.pop(i)
+                    self.learning_status.setText("Son öğrenme geri alındı.")
+                return
+        self.learning_status.setText("Bu eğitim için oturumda geri alınacak öğrenme yok.")
+
+    def _reset_learning(self):
+        if self._commit_learning({}):
+            self._clear_learning_review()
+            self.learning_status.setText("Sonradan öğrenilenler temizlendi; ilk beş kayıt korundu.")
+
+    def _on_record(self, record):
+        if self.is_test:
+            target=self._test_expected if self._test_expected is not None else normalize(self.expected_entry.text())
+            record.expected='' if target=='-' else target
+        if not record.accepted: record.outcome=dg.OUT_NOT_ACCEPTED
+        self.log.add(record)
+        self._pending_record=record if record.accepted else None
+
+    def _tag_outcome(self, outcome):
+        record=self._pending_record
+        if record:
+            record.outcome=outcome
+            if outcome==dg.OUT_KEY_SENT: record.key_sent_wall=self.last_key_sent_at
+        self._pending_record=None
+
+    def show_summary(self):
+        QMessageBox.information(self,'Doğrulama özeti',self.log.format_summary()+
+            "\n\nSayılar bu oturumdaki kişisel tanıma denemeleridir. Etiketsiz canlı sonuçlar doğruluk sayılmaz.\n"
+            "Komut dışı konuşma testi için hedefe - yazın. Donanım gecikmesi ve oyunun tepki süresi ölçülmez.")
+
+    def export_validation(self):
+        from PySide6.QtWidgets import QFileDialog
+        import json
+        rows=self.log.export_features()
+        if not rows:
+            self.info('Doğrulama kaydı yok','Özellik toplama kutusunu işaretleyip yeni söyleyişlerle Deneme yapın. Komut dışı konuşma için hedefe - yazın.'); return
+        path,_=QFileDialog.getSaveFileName(self,'Sayısal doğrulama özelliklerini dışa aktar','autopress_validation.json','JSON (*.json)')
+        if path:
+            try: Path(path).write_text(json.dumps({'schema_version':1,'profile':self.profile_name,'records':rows},ensure_ascii=False,allow_nan=False),encoding='utf-8')
+            except (ValueError,OSError) as exc: self.info('Dışa aktarılamadı',str(exc))
+
+    def _on_diagnostics(self, data):
+        text = self.hero_latency.toolTip()
+        if self.last_key_sent_at is not None and self.last_key_sent_at >= data["decision_at"]:
+            text += f"\nKarardan tuşa: {(self.last_key_sent_at-data['decision_at'])*1000:.1f} ms"
+            text += f"\nKonuşma sonundan tuşa: {(self.last_key_sent_at-data['speech_end'])*1000:.1f} ms"
+        text += "\nKarar: " + data['reason']
+        text += "\nEn yakın adaylar: " + str(data['scores'])
+        if data.get("phonetic_candidate"): text += "\nEk ses kontrolü: " + data["phonetic_candidate"]
+        self.hero_latency.setToolTip(text)
+
     def _on_timings(self, features_ms, match_ms, silence_ms):
         self.hero_latency.setToolTip(
             f"Ses özellikleri: {features_ms:.1f} ms\n"
@@ -665,24 +1043,29 @@ class MainWindow(QMainWindow):
             "Ana süre konuşmayı da içerir; oyunun tepki süresini içermez.")
 
     def _on_phrase(self, phrase, latency):
+        if self._pending_record and self._pending_record.accepted != normalize(phrase): self._pending_record=None
         if self.worker_kind == "wizard":
             self.stop_listening(); self.phrase_entry.setText(normalize(phrase)); self.selected = ""
             self.scope.trigger(); self.hero_phrase.setText(normalize(phrase)); self.key_cap.set_key("", None)
             self.set_status("İfadeyi kontrol edin, ‘Tuşu yakala’ ile tuşu seçip kaydedin."); return
         cmd = self._profile().get("commands", {}).get(normalize(phrase))
-        self.scope.trigger(); self.hero_phrase.setText(phrase); self.hero_latency.setText(f"{latency:.0f} ms")
-        if self.is_test: return
-        if not cmd: self.set_status(f"‘{phrase}’ duyuldu ama bu profilde tuş eşlemesi yok."); return
+        self.hero_phrase.setText(phrase); self.hero_latency.setText(f"{latency:.0f} ms")
+        if self.is_test: self._tag_outcome(dg.OUT_TEST_ONLY); return
+        if not cmd: self._tag_outcome(dg.OUT_NO_MAPPING); self.set_status(f"‘{phrase}’ duyuldu ama bu profilde tuş eşlemesi yok."); return
         if self.focus_check.isChecked() and not self._game_focused():
+            self._tag_outcome(dg.OUT_BLOCKED_FOCUS)
             t = self._profile().get("target_window", "")
             why = f"‘{t}’ penceresi ön planda değil." if t else "Ayarlar’da oyun penceresi adı kayıtlı değil."
             self.set_status(f"‘{phrase}’ duyuldu; güvenlik nedeniyle tuş gönderilmedi. {why}"); return
         now, key = time.monotonic(), cmd["key"]
-        if cmd["mode"] == "hold" and key in self.keys.held: self.keys.release(key)
-        elif normalize(phrase) != self.last_command or (now - self.last_time) * 1000 >= 1000:
+        if cmd["mode"] == "hold" and key in self.keys.held:
+            try: self.keys.release(key)
+            except Exception as exc:
+                self._tag_outcome(dg.OUT_SEND_ERROR); self.set_status(f"Tuş bırakılamadı: {exc}"); return
+        else:
             try:
                 if cmd["mode"] == "press":
-                    if key in self.keys.held: return
+                    if key in self.keys.held: self._tag_outcome(dg.OUT_BLOCKED_HELD); return
                     self.keys.hold(key, cmd.get("vk"), self.scan_check.isChecked())
                     delay = self.press_duration.value()
                     if delay:
@@ -691,8 +1074,10 @@ class MainWindow(QMainWindow):
                     else: self.keys.release(key)
                 else: self.keys.hold(key, cmd.get("vk"), self.scan_check.isChecked())
                 self.last_command, self.last_time = normalize(phrase), now
-            except Exception as exc: self.set_status(f"Tuş gönderilemedi: {exc}"); return
-        self.hero_key.set_text(key); self.hero_key.flash()
+            except Exception as exc: self._tag_outcome(dg.OUT_SEND_ERROR); self.set_status(f"Tuş gönderilemedi: {exc}"); return
+        self.last_key_sent_at = time.perf_counter()
+        self._tag_outcome(dg.OUT_KEY_SENT)
+        self.scope.trigger(); self.hero_key.set_text(key); self.hero_key.flash()
         self.set_status(f"‘{phrase}’ çalıştırıldı: {key} · {latency:.0f} ms")
 
     def _release_short_press(self, key, generation):
@@ -701,22 +1086,29 @@ class MainWindow(QMainWindow):
         except Exception as exc: self.set_status(f"Tuş bırakma hatası: {exc}")
 
     def _on_observed(self, method, text, score, latency, stage):
+        if stage == "akış":
+            self.hero_latency.setToolTip("Akış bloğunun işlem süresi. Konuşma sonundan tuşa kadar uçtan uca gecikme değildir.")
         if latency > 0: self.metrics = (self.metrics + [latency])[-100:]
         if not self.is_test or self.worker_kind == "wizard": return
         target, det = normalize(self.expected_entry.text()), normalize(text) if text else ""
-        if stage == "reddedildi": verdict, col = "KARARSIZ — TUŞ TETİKLENMEDİ", "#e5484d"
+        if target == "-": verdict,col = ("KOMUT DIŞI KONUŞMADA TETİKLEME", "#e5484d") if det else ("KOMUT DIŞI KONUŞMA REDDEDİLDİ", "#6fcf97")
+        elif stage in ("reddedildi", "kararsız", "uzak"): verdict, col = "KARARSIZ — TUŞ TETİKLENMEDİ", "#e5484d"
         elif not det: verdict, col = "EŞLEŞME YOK", DIM
         elif det == target: verdict, col = "HEDEFLE EŞLEŞTİ", "#6fcf97"
         else: verdict, col = "FARKLI İFADE", AMBER
-        q = ("Ses uzaklığı: " + (f"{score:.2f}" if score != float("inf") else "—")) if method == "örüntü" else f"Güven: {score:.2f}"
+        counts = self.validation_counts.setdefault(target, [0, 0, 0])
+        counts[0 if det == target and stage not in ("kararsız", "uzak", "reddedildi") else 1 if not det else 2] += 1
+        q = ("Ses uzaklığı: " + (f"{score:.2f}" if score != float("inf") else "—")) if method.startswith("örüntü") else f"Güven: {score:.2f}"
         card = QFrame(); card.setObjectName("row"); card.setStyleSheet(f"QFrame#row{{border-left:4px solid {col}}}")
         cl = QVBoxLayout(card); cl.setContentsMargins(14, 10, 14, 10); cl.setSpacing(2)
         v = label(verdict, "rowt"); v.setStyleSheet(f"color:{col};font-size:15px"); cl.addWidget(v)
-        cl.addWidget(label(f"YÖNTEM {method} · HEDEF {target or '—'} · DUYULAN {text or '—'}\n{q} · GECİKME " +
-                           (f"{latency:.0f} ms" if latency >= 0 else "ölçülemedi"), "mono", True))
+        cl.addWidget(label(f"Doğru: {counts[0]} · Reddedilen: {counts[1]} · Yanlış: {counts[2]}\nYÖNTEM {method} · HEDEF {target or '—'} · DUYULAN {text or '—'}\n{q} · GECİKME " +
+                           (f"{latency:.0f} ms" if latency >= 0 else "ölçülemedi") + f" · Karar: {stage}", "mono", True))
         self.results_lay.insertWidget(0, card); self.scope.trigger()
 
     def clear_results(self):
+        self.log.clear(); self._pending_record=None
+        self.validation_counts.clear()
         while self.results_lay.count() > 1:
             w = self.results_lay.takeAt(0).widget()
             if w: w.deleteLater()

@@ -91,3 +91,34 @@ def test_prepared_matcher_accepts_rejects_and_keeps_session_snapshot():
     assert PreparedTemplateMatcher({'zırh': template, 'zıpla': template}, .65).match(features)[0] is None
     assert PreparedTemplateMatcher({}, .65).match(features) == (None, float('inf'))
     assert matcher.match([]) == (None, float('inf'))
+
+
+def test_short_command_features_keep_spectral_identity_and_consensus():
+    from autopress.acoustic import ShortCommandMatcher, build_short_template
+    rate = 16000
+    t = np.arange(3200, dtype=np.float32) / rate
+    def feature(hz):
+        return mfcc_features((np.sin(2 * np.pi * hz * t) * 8000).astype('<i2').tobytes(), version=2)
+    first, second = feature(180), feature(760)
+    assert len(first[0]) == 24
+    matcher = ShortCommandMatcher({'q': build_short_template([first] * 5),
+                                   'w': build_short_template([second] * 5)})
+    assert matcher.match(first)[0] == 'q'
+    assert matcher.match(second)[0] == 'w'
+    ambiguous = ShortCommandMatcher({'q': build_short_template([first] * 5),
+                                     'w': build_short_template([first] * 5)})
+    assert ambiguous.match(first)[0] is None
+    assert ambiguous.last_reason == 'kararsız'
+
+
+def test_personal_calibration_generalizes_and_rejects_unrelated_features():
+    from autopress.acoustic import ShortCommandMatcher, build_short_template
+    rng = np.random.default_rng(81)
+    bases = [rng.normal(i * 2, .5, size=(30, 24)) for i in range(3)]
+    templates = {str(i): build_short_template([(base + rng.normal(0, .2, base.shape)).tolist()
+                                              for _ in range(5)]) for i, base in enumerate(bases)}
+    matcher = ShortCommandMatcher(templates)
+    for i, base in enumerate(bases):
+        # Held-out perturbation, never used to calibrate the matcher.
+        assert matcher.match(base + rng.normal(0, .2, base.shape))[0] == str(i)
+    assert matcher.match(rng.normal(80, 1, (30, 24)))[0] is None

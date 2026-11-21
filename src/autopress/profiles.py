@@ -67,33 +67,67 @@ def validate_profiles(profiles: Any) -> dict[str, dict]:
         for phrase, template in patterns.items():
             norm = normalize(phrase) if isinstance(phrase, str) else ""
             norm = legacy_aliases.get(norm, norm)
-            if norm not in checked or not isinstance(template, dict) or template.get("version") != 1:
+            if norm not in checked or not isinstance(template, dict) or template.get("version") not in (1, 2, 3):
                 raise ValueError(f"{name}: ses örüntüsü komutla eşleşmiyor.")
             samples = template.get("samples")
             if not isinstance(samples, list) or not 3 <= len(samples) <= 5:
                 raise ValueError(f"{name}/{norm}: 3–5 kişisel örnek gerekli.")
+            neural = template['version'] == 3
+            if neural:
+                from .neural import MODEL_ID
+                if template.get('model_id') != MODEL_ID: raise ValueError('Sinir ağı model sürümü uyumsuz.')
             clean_samples = []
             for sample in samples:
-                if not isinstance(sample, list) or not 4 <= len(sample) <= 500:
+                if not isinstance(sample, list) or not ((len(sample) == 1) if neural else (4 <= len(sample) <= 500)):
                     raise ValueError(f"{name}/{norm}: ses özellikleri geçersiz.")
                 clean_frames = []
                 for frame in sample:
-                    if not isinstance(frame, list) or len(frame) != 12:
+                    if not isinstance(frame, list) or len(frame) != (96 if neural else 24 if template["version"] == 2 else 12):
                         raise ValueError(f"{name}/{norm}: ses özellikleri geçersiz.")
                     values = [float(value) for value in frame]
-                    if any(not math.isfinite(value) or abs(value) > 10 for value in values):
+                    if any(not math.isfinite(value) or abs(value) > (1000 if template["version"] == 2 else 10) for value in values):
                         raise ValueError(f"{name}/{norm}: sonlu olmayan ses özelliği.")
                     clean_frames.append(values)
                 clean_samples.append(clean_frames)
             threshold = float(template.get("threshold", 0.0))
             if not math.isfinite(threshold) or not 0.05 <= threshold <= 20:
                 raise ValueError(f"{name}/{norm}: eşik geçersiz.")
-            checked_patterns[norm] = {"version": 1, "samples": clean_samples, "threshold": threshold}
+            checked_patterns[norm] = {**({"model_id": template["model_id"]} if neural else {}),"version": template["version"], "samples": clean_samples, "threshold": threshold}
+            if neural and 'phonetic_samples' in template:
+                paired = {'version':2,'samples':template['phonetic_samples'],'threshold':.5}
+                checked_pair = validate_profiles({name:{'commands':commands,'audio_templates':{phrase:paired}}})[name]['audio_templates'][norm]
+                checked_patterns[norm]['phonetic_samples'] = checked_pair['samples']
+        pending = profile.get("pending_audio_templates", {})
+        if pending:
+            staged = validate_profiles({name: {"commands": commands, "audio_templates": pending}})[name]
+            pending = staged["audio_templates"]
+        neural_maps = {}
+        for field in ('neural_templates', 'pending_neural_templates'):
+            entries = profile.get(field, {})
+            if not isinstance(entries, dict): raise ValueError('Sinir ağı kayıtları geçersiz.')
+            if any(not isinstance(t, dict) or t.get('version') != 3 for t in entries.values()):
+                raise ValueError('Sinir ağı alanında eski örnek sürümü var.')
+            neural_maps[field] = validate_profiles({name: {'commands': commands, 'audio_templates': entries}})[name]['audio_templates'] if entries else {}
+        continuous = profile.get("continuous_spotting", False)
+        from .learning import validate_learning
+        learning = validate_learning(profile.get('adaptive_learning', {}), neural_maps['neural_templates'])
+        verify_sounds = profile.get('verify_similar_sounds', True)
+        if not isinstance(verify_sounds, bool): raise ValueError('Ses doğrulaması ayarı geçersiz.')
+        auto_learning = profile.get('auto_learning', True)
+        if not isinstance(auto_learning, bool): raise ValueError('Otomatik öğrenme ayarı geçersiz.')
+        if not isinstance(continuous, bool): raise ValueError("Akış algılama ayarı geçersiz.")
+        mode = profile.get("decision_mode", "balanced")
+        if mode not in ("selective", "balanced", "aggressive"):
+            raise ValueError("Karar modu geçersiz.")
         silence_ms = profile.get("silence_ms", 150)
         if isinstance(silence_ms, bool) or not isinstance(silence_ms, int) or not 100 <= silence_ms <= 600:
             raise ValueError(f"{name}: sessizlik beklemesi 100–600 ms arasında tam sayı olmalı.")
-        out[name.strip()] = {"name": name.strip(), "commands": checked,
-                             "silence_ms": silence_ms,
+        out[name.strip()] = {**neural_maps, "name": name.strip(), "commands": checked,
+                             "adaptive_learning": learning, "auto_learning": auto_learning,
+                             "verify_similar_sounds": verify_sounds,
+                             "silence_ms": silence_ms, "decision_mode": mode,
+                             "early_commands": [x for x in profile.get("early_commands", []) if isinstance(x, str) and x in checked],
+                             "pending_audio_templates": pending, "continuous_spotting": continuous,
                              "target_window": str(profile.get("target_window", "")).strip(),
                              "audio_templates": checked_patterns}
     return out

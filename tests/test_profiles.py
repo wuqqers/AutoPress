@@ -17,6 +17,19 @@ def test_save_load_roundtrip(tmp_path):
     save_profiles(path,profiles); assert load_profiles(path)==validate_profiles(profiles)
 
 
+def test_v2_training_staging_and_decision_mode_roundtrip(tmp_path):
+    from autopress.acoustic import build_short_template
+    template = build_short_template([[[25.] * 24 for _ in range(6)]] * 5)
+    data = {'LOL': {'commands': {'q': {'key': 'Q', 'mode': 'press'}},
+                    'pending_audio_templates': {'q': template}, 'decision_mode': 'aggressive'}}
+    path = tmp_path / 'profiles.json'
+    save_profiles(path, data)
+    profile = load_profiles(path)['LOL']
+    assert profile['pending_audio_templates']['q'] == template
+    assert profile['decision_mode'] == 'aggressive'
+    assert profile['audio_templates'] == {}
+
+
 def test_silence_setting_is_persisted_per_profile(tmp_path):
     path = tmp_path / 'profiles.json'
     profiles = {'A': {'commands': {}, 'silence_ms': 125},
